@@ -11,6 +11,7 @@ from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
+    get_dp_group,
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -289,10 +290,28 @@ class GptOssModel(nn.Module):
             return x, aux_hidden_states
         return x
 
+    def _moe_shard_coords(self, use_ep: bool) -> tuple[int, int]:
+        """Return (rank, size) of the group the MoE weights are sharded over.
+
+        When EP is disabled, FusedMoE shards the experts across *all* devices by
+        flattening TP across DP (see FusedMoEParallelConfig.make ->
+        flatten_tp_across_dp). The parameters were allocated with that flattened
+        size, so the loaders must compute their slicing bounds the same way --
+        the plain TP group is the wrong question to ask. When EP is enabled the
+        expert dimension is split instead, and the TP group is already correct.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        if use_ep:
+            return tp_rank, tp_size
+        dp_size = get_dp_group().world_size
+        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        return dp_rank * tp_size + tp_rank, dp_size * tp_size
+
     def _load_weights_mxfp4(
         self,
-        ep_rank_end: int,
         ep_rank_start: int,
+        ep_rank_end: int,
         heads_per_rank: int,
         head_start: int,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -305,8 +324,7 @@ class GptOssModel(nn.Module):
         use_ep = self.parallel_config.enable_expert_parallel
         num_experts = self.config.num_local_experts
 
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank, tp_size = self._moe_shard_coords(use_ep)
 
         intermediate_size = self.config.intermediate_size
         intermediate_size_block = intermediate_size // mxfp4_block
@@ -488,8 +506,7 @@ class GptOssModel(nn.Module):
 
         use_ep = self.parallel_config.enable_expert_parallel
 
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank, tp_size = self._moe_shard_coords(use_ep)
 
         intermediate_size = self.config.intermediate_size
         per_rank_intermediate_size = cdiv(intermediate_size, tp_size)
@@ -609,8 +626,8 @@ class GptOssModel(nn.Module):
         )
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
-                ep_rank_end,
                 ep_rank_start,
+                ep_rank_end,
                 heads_per_rank,
                 head_start,
                 weights,
@@ -618,8 +635,8 @@ class GptOssModel(nn.Module):
             )
         else:
             return self._load_weights_other(
-                ep_rank_end,
                 ep_rank_start,
+                ep_rank_end,
                 heads_per_rank,
                 head_start,
                 weights,
